@@ -1,28 +1,174 @@
 import discord
 from discord.ext import commands
 from discord import app_commands
-from config import TOKEN, GUILD_ID, ALT_THRESHOLD
-from database import init_db, upsert_member, get_member, get_all_members_except, get_manual_alt_links, add_alt_link, set_setting, get_setting
-from similarity import calculate_similarity
+import os
+import sqlite3
+import difflib
+from datetime import datetime
 
+# ---------- CONFIG ----------
+TOKEN = os.getenv("DISCORD_TOKEN")
+GUILD_ID = int(os.getenv("GUILD_ID", "0"))
+DB_PATH = os.getenv("DB_PATH", "alt_database.db")
+
+WEIGHTS = {
+    "username_similarity": 5,
+    "same_avatar": 10,
+    "creation_close": 5,
+    "join_close": 5,
+    "same_discriminator": 2,
+}
+ALT_THRESHOLD = 8
+USERNAME_SIMILARITY_RATIO = 0.7
+
+# ---------- DATABASE ----------
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS members
+                 (user_id INTEGER PRIMARY KEY,
+                  username TEXT,
+                  discriminator TEXT,
+                  avatar_hash TEXT,
+                  created_at TEXT,
+                  joined_at TEXT,
+                  last_updated TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS alt_links
+                 (main_user_id INTEGER,
+                  alt_user_id INTEGER,
+                  reason TEXT,
+                  linked_at TEXT,
+                  PRIMARY KEY (main_user_id, alt_user_id))''')
+    c.execute('''CREATE TABLE IF NOT EXISTS settings
+                 (key TEXT PRIMARY KEY,
+                  value TEXT)''')
+    conn.commit()
+    conn.close()
+
+def upsert_member(member):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    avatar_hash = str(member.avatar) if member.avatar else "default"
+    c.execute('''INSERT OR REPLACE INTO members
+                 (user_id, username, discriminator, avatar_hash, created_at, joined_at, last_updated)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)''',
+              (member.id, str(member), member.discriminator, avatar_hash,
+               member.created_at.isoformat(), member.joined_at.isoformat(),
+               datetime.utcnow().isoformat()))
+    conn.commit()
+    conn.close()
+
+def get_member(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT * FROM members WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    return row
+
+def get_all_members_except(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT * FROM members WHERE user_id != ?", (user_id,))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def add_alt_link(main_user_id, alt_user_id, reason="Manual link"):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO alt_links (main_user_id, alt_user_id, reason, linked_at) VALUES (?, ?, ?, ?)",
+              (main_user_id, alt_user_id, reason, datetime.utcnow().isoformat()))
+    conn.commit()
+    conn.close()
+
+def get_manual_alt_links(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT alt_user_id FROM alt_links WHERE main_user_id = ?", (user_id,))
+    alts1 = [row[0] for row in c.fetchall()]
+    c.execute("SELECT main_user_id FROM alt_links WHERE alt_user_id = ?", (user_id,))
+    alts2 = [row[0] for row in c.fetchall()]
+    conn.close()
+    return list(set(alts1 + alts2))
+
+def set_setting(key, value):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
+    conn.commit()
+    conn.close()
+
+def get_setting(key, default=None):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT value FROM settings WHERE key = ?", (key,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else default
+
+# ---------- SIMILARITY ----------
+def parse_iso(iso_str):
+    return datetime.fromisoformat(iso_str)
+
+def username_similarity(name1, name2):
+    return difflib.SequenceMatcher(None, name1.lower(), name2.lower()).ratio()
+
+def calculate_similarity(member_data, other_data):
+    score = 0
+    reasons = []
+    uid1, uname1, discrim1, avatar1, created1, joined1, _ = member_data
+    uid2, uname2, discrim2, avatar2, created2, joined2, _ = other_data
+
+    sim = username_similarity(uname1, uname2)
+    if sim >= USERNAME_SIMILARITY_RATIO:
+        score += WEIGHTS["username_similarity"]
+        reasons.append(f"Similar username ({sim:.0%} match)")
+
+    if avatar1 == avatar2 and avatar1 != "default":
+        score += WEIGHTS["same_avatar"]
+        reasons.append("Same avatar")
+
+    try:
+        created1_dt = parse_iso(created1)
+        created2_dt = parse_iso(created2)
+        if abs((created1_dt - created2_dt).days) <= 7:
+            score += WEIGHTS["creation_close"]
+            reasons.append("Accounts created within 7 days")
+    except:
+        pass
+
+    try:
+        joined1_dt = parse_iso(joined1)
+        joined2_dt = parse_iso(joined2)
+        if abs((joined1_dt - joined2_dt).days) <= 7:
+            score += WEIGHTS["join_close"]
+            reasons.append("Joined server within 7 days")
+    except:
+        pass
+
+    if discrim1 and discrim2 and discrim1 == discrim2 and discrim1 != "0":
+        score += WEIGHTS["same_discriminator"]
+        reasons.append("Same discriminator")
+
+    return score, reasons
+
+# ---------- BOT ----------
 intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True
-
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}")
     init_db()
-    # Index existing members
     guild = bot.get_guild(GUILD_ID)
     if guild:
         for member in guild.members:
             if not member.bot:
                 upsert_member(member)
         print(f"Indexed {guild.member_count} members.")
-    # Sync slash commands
     try:
         synced = await bot.tree.sync()
         print(f"Synced {len(synced)} command(s)")
@@ -35,11 +181,9 @@ async def on_member_join(member):
         return
     upsert_member(member)
 
-    # Run alt detection
     user_data = get_member(member.id)
     if not user_data:
         return
-
     all_others = get_all_members_except(member.id)
     potential_alts = []
     for other in all_others:
@@ -50,7 +194,6 @@ async def on_member_join(member):
                 potential_alts.append((other_member, score, reasons))
     potential_alts.sort(key=lambda x: x[1], reverse=True)
 
-    # Get alert channel from settings
     alert_channel_id = get_setting("alert_channel")
     if alert_channel_id:
         channel = member.guild.get_channel(int(alert_channel_id))
@@ -67,19 +210,12 @@ async def on_member_join(member):
 
             if potential_alts:
                 alt_list = []
-                for alt_member, score, reasons in potential_alts[:5]:  # top 5
+                for alt_member, score, reasons in potential_alts[:5]:
                     alt_list.append(f"**{alt_member}** (Score: {score}) — {', '.join(reasons)}")
-                embed.add_field(
-                    name=f"Potential Alts ({len(potential_alts)})",
-                    value="\n".join(alt_list) or "None",
-                    inline=False
-                )
+                embed.add_field(name=f"Potential Alts ({len(potential_alts)})", value="\n".join(alt_list) or "None", inline=False)
             else:
                 embed.add_field(name="Potential Alts", value="None detected", inline=False)
-
             await channel.send(embed=embed)
-
-# ------------------- Slash Commands -------------------
 
 @bot.tree.command(name="setalertchannel", description="Set the channel for join alerts (Admin only)")
 @app_commands.default_permissions(administrator=True)
@@ -91,17 +227,14 @@ async def set_alert_channel(interaction: discord.Interaction, channel: discord.T
 @bot.tree.command(name="alt", description="Find potential alt accounts of a user")
 @app_commands.describe(user="User to check (mention or ID)")
 async def alt_command(interaction: discord.Interaction, user: discord.User):
-    await interaction.response.defer(thinking=True)  # May take time
-
+    await interaction.response.defer(thinking=True)
     guild = interaction.guild
     member = guild.get_member(user.id)
     if member is None:
         await interaction.followup.send("❌ That user is not in this server.")
         return
 
-    # Update their data
     upsert_member(member)
-
     user_data = get_member(member.id)
     if not user_data:
         await interaction.followup.send("❌ User data not found.")
@@ -150,13 +283,6 @@ async def alt_command(interaction: discord.Interaction, user: discord.User):
         embed.add_field(name="No potential alts found", value="No similar accounts detected.", inline=False)
 
     await interaction.followup.send(embed=embed)
-
-# Legacy prefix command for /linkalt (optional, can be converted to slash later)
-@bot.command(name="linkalt")
-@commands.has_permissions(administrator=True)
-async def link_alt(ctx, user1: discord.User, user2: discord.User, *, reason="Manual link"):
-    add_alt_link(user1.id, user2.id, reason)
-    await ctx.send(f"✅ Linked {user1.mention} and {user2.mention} as alts.")
 
 if __name__ == "__main__":
     bot.run(TOKEN)
